@@ -1,0 +1,38 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Entornos virtuales
+venv/
+.venv/
+env/
+
+# Variables de entorno y secretos
+.env
+.env.*
+!.env.example
+
+# Archivos temporales
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# Frontend
+node_modules/
+dist/
+build/
+
+# Bases de datos y respaldos
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+*.backup
+
+# Editores
+.idea/
+.vscode/

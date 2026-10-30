@@ -1,0 +1,2288 @@
+# .\venv\Scripts\Activate.ps1
+# $env:VALEN_SECRET_KEY = "<clave de 32+ caracteres>"   (ver auth.py)
+# $env:VALEN_SECRET_KEY = "PEGA_AQUI_LA_CLAVE_GENERADA"
+# uvicorn main:app --reload
+import logging
+from datetime import datetime
+
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
+
+from auth import Contexto, contexto_negocio, contexto_usuario, crear_token, solo_admin
+from database import engine, SessionLocal
+from models import (
+    Servicio,
+    Cliente,
+    Usuario,
+    UsuarioNegocio,
+    Negocio,
+    Producto,
+    EmpleadoServicio,
+    Horario,
+    Pausa,
+    Cita,
+    ServicioDeCita,
+    ProductoDeCita,
+)
+from reglas import (
+    ESTADOS_ELIMINABLES,
+    calcular_hora_fin,
+    descontar_stock_de_cita,
+    duracion_de_cita_minutos,
+    duracion_servicios_minutos,
+    exigir_agenda_cubre_citas_futuras,
+    exigir_asociacion_libre,
+    exigir_cita_editable,
+    exigir_cita_iniciada,
+    exigir_cliente_valido,
+    exigir_email_libre,
+    exigir_empleado_atiende_servicios,
+    exigir_empleado_valido,
+    exigir_producto_para_cita,
+    exigir_puede_operar_cita,
+    exigir_queda_otro_admin,
+    exigir_servicio_para_empleado,
+    exigir_sin_citas_futuras,
+    exigir_telefono_libre,
+    obtener_del_negocio,
+    obtener_horario_del_negocio,
+    obtener_o_404,
+    obtener_pausa_del_negocio,
+    validar_antelacion,
+    validar_cliente_sin_solape,
+    validar_disponibilidad,
+    validar_no_en_el_pasado,
+    validar_pausa,
+    validar_pausas_dentro_de_horario,
+    validar_solape_horarios,
+    validar_transicion,
+)
+import schemas
+from seguridad import HASH_DE_RELLENO, hashear_password, verificar_password
+
+logger = logging.getLogger("valen")
+
+app = FastAPI()
+
+# Quién puede hacer qué (cada endpoint lo declara en su Depends):
+#   Público ............ POST /usuarios, POST /auth/login, / y /prueba-db
+#   Cualquier sesión ... Depends(contexto_usuario)
+#   Con negocio elegido  Depends(contexto_negocio)  (ADMIN o EMPLEADO)
+#   Solo ADMIN ......... Depends(solo_admin)
+
+
+@app.exception_handler(IntegrityError)
+def conflicto_de_integridad(request: Request, exc: IntegrityError):
+    # Red de seguridad: si algo llega hasta una restricción de la base de datos
+    # se responde 409 en vez de 500. La causa real queda en el log.
+    logger.warning("IntegrityError en %s %s: %s", request.method, request.url.path, exc.orig)
+
+    return JSONResponse(
+        status_code=409,
+        content={"detail": "La operación choca con datos existentes (duplicado o referencia inválida)"}
+    )
+
+
+@app.get("/")
+def inicio():
+    return {"mensaje": "Bienvenido a Valen"}
+
+
+@app.get("/prueba-db")
+def prueba_db():
+    with engine.connect() as conexion:
+        resultado = conexion.exec_driver_sql("SELECT 1")
+        return {"resultado": resultado.scalar()}
+
+
+# ---------------------------------------------------------------------------
+# Autenticación
+# ---------------------------------------------------------------------------
+def _negocios_del_usuario(db, usuario_id: int):
+    return db.execute(
+        select(UsuarioNegocio, Negocio)
+        .join(Negocio, Negocio.id == UsuarioNegocio.negocio_id)
+        .where(
+            UsuarioNegocio.usuario_id == usuario_id,
+            UsuarioNegocio.activo == True
+        )
+        .order_by(Negocio.nombre)
+    ).all()
+
+
+def _resumen_negocios(filas):
+    return [
+        {"id": negocio.id, "nombre": negocio.nombre, "rol": vinculo.rol}
+        for vinculo, negocio in filas
+    ]
+
+
+@app.post("/auth/login")
+def login(datos: schemas.LoginCrear):
+    db = SessionLocal()
+
+    try:
+        usuario = db.execute(
+            select(Usuario).where(func.lower(Usuario.email) == datos.email)
+        ).scalars().first()
+
+        # Se verifica una contraseña aunque el email no exista (ver seguridad.py)
+        hash_guardado = usuario.password_hash if usuario else HASH_DE_RELLENO
+        coincide = verificar_password(datos.password, hash_guardado)
+
+        if usuario is None or not coincide:
+            raise HTTPException(
+                status_code=401,
+                detail="Email o contraseña incorrectos",
+                headers={"WWW-Authenticate": "Bearer"}
+            )
+
+        filas = _negocios_del_usuario(db, usuario.id)
+        elegido = None
+
+        if datos.negocio_id is not None:
+            elegido = next((f for f in filas if f[1].id == datos.negocio_id), None)
+
+            if elegido is None:
+                raise HTTPException(status_code=403, detail="No perteneces a ese negocio")
+
+        elif len(filas) == 1:
+            elegido = filas[0]
+
+        vinculo = elegido[0] if elegido else None
+
+        respuesta = {
+            "access_token": crear_token(usuario.id, vinculo.id if vinculo else None),
+            "token_type": "bearer",
+            "negocio_id": vinculo.negocio_id if vinculo else None,
+            "rol": vinculo.rol if vinculo else None,
+            "negocios": _resumen_negocios(filas)
+        }
+
+        if not filas:
+            respuesta["mensaje"] = "Aún no perteneces a ningún negocio: crea uno con POST /negocios"
+        elif elegido is None:
+            respuesta["mensaje"] = (
+                "Perteneces a varios negocios: elige uno con POST /auth/negocio/{negocio_id}"
+            )
+
+        return respuesta
+
+    finally:
+        db.close()
+
+
+@app.post("/auth/negocio/{negocio_id}")
+def elegir_negocio(negocio_id: int, ctx: Contexto = Depends(contexto_usuario)):
+    db = SessionLocal()
+
+    try:
+        filas = _negocios_del_usuario(db, ctx.usuario_id)
+        elegido = next((f for f in filas if f[1].id == negocio_id), None)
+
+        if elegido is None:
+            raise HTTPException(status_code=403, detail="No perteneces a ese negocio")
+
+        vinculo, negocio = elegido
+
+        return {
+            "access_token": crear_token(ctx.usuario_id, vinculo.id),
+            "token_type": "bearer",
+            "negocio_id": negocio.id,
+            "rol": vinculo.rol
+        }
+
+    finally:
+        db.close()
+
+
+@app.get("/auth/me")
+def quien_soy(ctx: Contexto = Depends(contexto_usuario)):
+    db = SessionLocal()
+
+    try:
+        usuario = obtener_o_404(db, Usuario, ctx.usuario_id, "Usuario no encontrado")
+
+        return {
+            "usuario": {
+                "id": usuario.id,
+                "nombre": usuario.nombre,
+                "email": usuario.email,
+                "fecha_creacion": usuario.fecha_creacion
+            },
+            "negocio_id": ctx.negocio_id,
+            "rol": ctx.rol,
+            "usuario_negocio_id": ctx.usuario_negocio_id,
+            "negocios": _resumen_negocios(_negocios_del_usuario(db, ctx.usuario_id))
+        }
+
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Servicio  (leer: cualquiera del negocio | escribir: ADMIN)
+# ---------------------------------------------------------------------------
+@app.get("/servicios")
+def obtener_servicios(ctx: Contexto = Depends(contexto_negocio)):
+    with engine.connect() as conexion:
+        resultado = conexion.execute(
+            select(Servicio).where(
+                Servicio.negocio_id == ctx.negocio_id,
+                Servicio.activo == True
+            )
+        )
+        servicios = resultado.fetchall()
+
+        return [
+            {
+                "id": servicio.id,
+                "negocio_id": servicio.negocio_id,
+                "nombre": servicio.nombre,
+                "descripcion": servicio.descripcion,
+                "duracion_minutos": servicio.duracion_minutos,
+                "precio": float(servicio.precio),
+                "activo": servicio.activo
+            }
+            for servicio in servicios
+        ]
+
+@app.get("/servicios/admin")
+def obtener_todos_los_servicios(ctx: Contexto = Depends(solo_admin)):
+    with engine.connect() as conexion:
+        resultado = conexion.execute(
+            select(Servicio).where(Servicio.negocio_id == ctx.negocio_id)
+        )
+        servicios = resultado.fetchall()
+
+        return [
+            {
+                "id": servicio.id,
+                "negocio_id": servicio.negocio_id,
+                "nombre": servicio.nombre,
+                "descripcion": servicio.descripcion,
+                "duracion_minutos": servicio.duracion_minutos,
+                "precio": float(servicio.precio),
+                "activo": servicio.activo
+            }
+            for servicio in servicios
+        ]
+
+
+@app.get("/servicios/{servicio_id}")
+def obtener_servicio(servicio_id: int, ctx: Contexto = Depends(contexto_negocio)):
+    db = SessionLocal()
+
+    try:
+        servicio = obtener_del_negocio(
+            db, Servicio, servicio_id, ctx, "Servicio no encontrado"
+        )
+
+        return {
+            "id": servicio.id,
+            "negocio_id": servicio.negocio_id,
+            "nombre": servicio.nombre,
+            "descripcion": servicio.descripcion,
+            "duracion_minutos": servicio.duracion_minutos,
+            "precio": float(servicio.precio),
+            "activo": servicio.activo
+        }
+
+    finally:
+        db.close()
+
+
+@app.post("/servicios")
+def crear_servicio(servicio: schemas.ServicioCrear, ctx: Contexto = Depends(solo_admin)):
+    db = SessionLocal()
+
+    try:
+        nuevo_servicio = Servicio(
+            negocio_id=ctx.negocio_id,
+            nombre=servicio.nombre,
+            descripcion=servicio.descripcion,
+            duracion_minutos=servicio.duracion_minutos,
+            precio=servicio.precio,
+            activo=True
+        )
+
+        db.add(nuevo_servicio)
+        db.commit()
+        db.refresh(nuevo_servicio)
+
+        return {
+            "mensaje": "Servicio creado correctamente",
+            "id": nuevo_servicio.id
+        }
+
+    finally:
+        db.close()
+
+@app.put("/servicios/{servicio_id}")
+def actualizar_servicio(
+    servicio_id: int,
+    datos: schemas.ServicioActualizar,
+    ctx: Contexto = Depends(solo_admin)
+):
+    db = SessionLocal()
+
+    try:
+        servicio = obtener_del_negocio(
+            db, Servicio, servicio_id, ctx, "Servicio no encontrado"
+        )
+
+        servicio.nombre = datos.nombre
+        servicio.descripcion = datos.descripcion
+        servicio.duracion_minutos = datos.duracion_minutos
+        servicio.precio = datos.precio
+
+        db.commit()
+        db.refresh(servicio)
+
+        return {
+            "mensaje": "Servicio actualizado correctamente",
+            "id": servicio.id
+        }
+
+    finally:
+        db.close()
+
+@app.delete("/servicios/{servicio_id}")
+def eliminar_servicio(servicio_id: int, ctx: Contexto = Depends(solo_admin)):
+    db = SessionLocal()
+
+    try:
+        servicio = obtener_del_negocio(
+            db, Servicio, servicio_id, ctx, "Servicio no encontrado"
+        )
+
+        exigir_sin_citas_futuras(
+            db,
+            f"desactivar el servicio '{servicio.nombre}'",
+            servicio_id=servicio.id
+        )
+
+        servicio.activo = False
+
+        db.commit()
+
+        return {
+            "mensaje": "Servicio eliminado correctamente",
+            "id": servicio.id
+        }
+
+    finally:
+        db.close()
+
+
+@app.patch("/servicios/{servicio_id}/activar")
+def activar_servicio(servicio_id: int, ctx: Contexto = Depends(solo_admin)):
+    db = SessionLocal()
+
+    try:
+        servicio = obtener_del_negocio(
+            db, Servicio, servicio_id, ctx, "Servicio no encontrado"
+        )
+
+        servicio.activo = True
+
+        db.commit()
+
+        return {
+            "mensaje": "Servicio activado correctamente",
+            "id": servicio.id
+        }
+
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Cliente  (leer, crear y editar: cualquiera del negocio | desactivar: ADMIN)
+# ---------------------------------------------------------------------------
+@app.get("/clientes")
+def obtener_clientes(ctx: Contexto = Depends(contexto_negocio)):
+    with engine.connect() as conexion:
+        resultado = conexion.execute(
+            select(Cliente).where(
+                Cliente.negocio_id == ctx.negocio_id,
+                Cliente.activo == True
+            )
+        )
+        clientes = resultado.fetchall()
+
+        return [
+            {
+                "id": cliente.id,
+                "negocio_id": cliente.negocio_id,
+                "nombre": cliente.nombre,
+                "telefono": cliente.telefono,
+                "fecha_creacion": cliente.fecha_creacion,
+                "activo": cliente.activo
+            }
+            for cliente in clientes
+        ]
+
+
+@app.get("/clientes/admin")
+def obtener_todos_los_clientes(ctx: Contexto = Depends(solo_admin)):
+    with engine.connect() as conexion:
+        resultado = conexion.execute(
+            select(Cliente).where(Cliente.negocio_id == ctx.negocio_id)
+        )
+        clientes = resultado.fetchall()
+
+        return [
+            {
+                "id": cliente.id,
+                "negocio_id": cliente.negocio_id,
+                "nombre": cliente.nombre,
+                "telefono": cliente.telefono,
+                "fecha_creacion": cliente.fecha_creacion,
+                "activo": cliente.activo
+            }
+            for cliente in clientes
+        ]
+
+@app.get("/clientes/{cliente_id}")
+def obtener_cliente(cliente_id: int, ctx: Contexto = Depends(contexto_negocio)):
+    db = SessionLocal()
+
+    try:
+        cliente = obtener_del_negocio(
+            db, Cliente, cliente_id, ctx, "Cliente no encontrado"
+        )
+
+        return {
+            "id": cliente.id,
+            "negocio_id": cliente.negocio_id,
+            "nombre": cliente.nombre,
+            "telefono": cliente.telefono,
+            "fecha_creacion": cliente.fecha_creacion,
+            "activo": cliente.activo
+        }
+
+    finally:
+        db.close()
+
+
+@app.post("/clientes")
+def crear_cliente(cliente: schemas.ClienteCrear, ctx: Contexto = Depends(contexto_negocio)):
+    db = SessionLocal()
+
+    try:
+        exigir_telefono_libre(db, ctx.negocio_id, cliente.telefono)
+
+        nuevo_cliente = Cliente(
+            negocio_id=ctx.negocio_id,
+            nombre=cliente.nombre,
+            telefono=cliente.telefono
+        )
+
+        db.add(nuevo_cliente)
+        db.commit()
+        db.refresh(nuevo_cliente)
+
+        return {
+            "mensaje": "Cliente creado correctamente",
+            "id": nuevo_cliente.id
+        }
+
+    finally:
+        db.close()
+
+@app.put("/clientes/{cliente_id}")
+def actualizar_cliente(
+    cliente_id: int,
+    cliente: schemas.ClienteActualizar,
+    ctx: Contexto = Depends(contexto_negocio)
+):
+    db = SessionLocal()
+
+    try:
+        cliente_actual = obtener_del_negocio(
+            db, Cliente, cliente_id, ctx, "Cliente no encontrado"
+        )
+
+        exigir_telefono_libre(
+            db,
+            ctx.negocio_id,
+            cliente.telefono,
+            excluir_cliente_id=cliente_actual.id
+        )
+
+        cliente_actual.nombre = cliente.nombre
+        cliente_actual.telefono = cliente.telefono
+
+        db.commit()
+        db.refresh(cliente_actual)
+
+        return {
+            "mensaje": "Cliente actualizado correctamente",
+            "id": cliente_actual.id
+        }
+
+    finally:
+        db.close()
+
+@app.delete("/clientes/{cliente_id}")
+def eliminar_cliente(cliente_id: int, ctx: Contexto = Depends(solo_admin)):
+    db = SessionLocal()
+
+    try:
+        cliente = obtener_del_negocio(
+            db, Cliente, cliente_id, ctx, "Cliente no encontrado"
+        )
+
+        exigir_sin_citas_futuras(
+            db,
+            f"desactivar al cliente '{cliente.nombre}'",
+            cliente_id=cliente.id
+        )
+
+        cliente.activo = False
+
+        db.commit()
+
+        return {
+            "mensaje": "Cliente eliminado correctamente",
+            "id": cliente.id
+        }
+
+    finally:
+        db.close()
+
+@app.patch("/clientes/{cliente_id}/activar")
+def activar_cliente(cliente_id: int, ctx: Contexto = Depends(solo_admin)):
+    db = SessionLocal()
+
+    try:
+        cliente = obtener_del_negocio(
+            db, Cliente, cliente_id, ctx, "Cliente no encontrado"
+        )
+
+        cliente.activo = True
+
+        db.commit()
+
+        return {
+            "mensaje": "Cliente activado correctamente",
+            "id": cliente.id
+        }
+
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Usuario  (el registro es público; ver/editar solo el propio perfil)
+# ---------------------------------------------------------------------------
+@app.post("/usuarios")
+def crear_usuario(usuario: schemas.UsuarioCrear):
+    db = SessionLocal()
+
+    try:
+        exigir_email_libre(db, usuario.email)
+
+        nuevo_usuario = Usuario(
+            nombre=usuario.nombre,
+            email=usuario.email,
+            password_hash=hashear_password(usuario.password)
+        )
+
+        db.add(nuevo_usuario)
+        db.commit()
+        db.refresh(nuevo_usuario)
+
+        return {
+            "mensaje": "Usuario creado correctamente",
+            "id": nuevo_usuario.id
+        }
+
+    finally:
+        db.close()
+
+
+@app.get("/usuarios")
+def obtener_usuarios(ctx: Contexto = Depends(solo_admin)):
+    # Las personas vinculadas (activas) al negocio del administrador
+    with engine.connect() as conexion:
+        resultado = conexion.execute(
+            select(Usuario)
+            .join(UsuarioNegocio, UsuarioNegocio.usuario_id == Usuario.id)
+            .where(
+                UsuarioNegocio.negocio_id == ctx.negocio_id,
+                UsuarioNegocio.activo == True
+            )
+        )
+
+        usuarios = resultado.fetchall()
+
+        return [
+            {
+                "id": usuario.id,
+                "nombre": usuario.nombre,
+                "email": usuario.email,
+                "fecha_creacion": usuario.fecha_creacion
+            }
+            for usuario in usuarios
+        ]
+
+
+@app.get("/usuarios/{usuario_id}")
+def obtener_usuario(usuario_id: int, ctx: Contexto = Depends(contexto_usuario)):
+    db = SessionLocal()
+
+    try:
+        if usuario_id != ctx.usuario_id:
+            # A otra persona solo la ve un admin, y solo si trabaja en su negocio
+            vinculo = None
+
+            if ctx.es_admin:
+                vinculo = db.execute(
+                    select(UsuarioNegocio).where(
+                        UsuarioNegocio.usuario_id == usuario_id,
+                        UsuarioNegocio.negocio_id == ctx.negocio_id
+                    )
+                ).scalars().first()
+
+            if vinculo is None:
+                raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+        usuario = obtener_o_404(db, Usuario, usuario_id, "Usuario no encontrado")
+
+        return {
+            "id": usuario.id,
+            "nombre": usuario.nombre,
+            "email": usuario.email,
+            "fecha_creacion": usuario.fecha_creacion
+        }
+
+    finally:
+        db.close()
+
+@app.put("/usuarios/{usuario_id}")
+def actualizar_usuario(
+    usuario_id: int,
+    usuario: schemas.UsuarioActualizar,
+    ctx: Contexto = Depends(contexto_usuario)
+):
+    db = SessionLocal()
+
+    try:
+        if usuario_id != ctx.usuario_id:
+            raise HTTPException(
+                status_code=403,
+                detail="Solo puedes modificar tu propio perfil"
+            )
+
+        usuario_actual = obtener_o_404(db, Usuario, usuario_id, "Usuario no encontrado")
+
+        exigir_email_libre(db, usuario.email, excluir_usuario_id=usuario_actual.id)
+
+        usuario_actual.nombre = usuario.nombre
+        usuario_actual.email = usuario.email
+
+        db.commit()
+        db.refresh(usuario_actual)
+
+        return {
+            "mensaje": "Usuario actualizado correctamente",
+            "id": usuario_actual.id
+        }
+
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# UsuarioNegocio (vínculos usuario <-> negocio). Solo ADMIN.
+# ---------------------------------------------------------------------------
+@app.post("/usuarios-negocios")
+def crear_usuario_negocio(
+    usuario_negocio: schemas.UsuarioNegocioCrear,
+    ctx: Contexto = Depends(solo_admin)
+):
+    # Vincula al negocio del admin a una persona que ya tiene cuenta (por email)
+    db = SessionLocal()
+
+    try:
+        usuario = db.execute(
+            select(Usuario).where(func.lower(Usuario.email) == usuario_negocio.email)
+        ).scalars().first()
+
+        if usuario is None:
+            raise HTTPException(
+                status_code=404,
+                detail="No existe un usuario con ese email. Pídele que se registre primero"
+            )
+
+        exigir_asociacion_libre(db, usuario.id, ctx.negocio_id)
+
+        nueva_asociacion = UsuarioNegocio(
+            usuario_id=usuario.id,
+            negocio_id=ctx.negocio_id,
+            rol=usuario_negocio.rol
+        )
+
+        db.add(nueva_asociacion)
+        db.commit()
+        db.refresh(nueva_asociacion)
+
+        return {
+            "mensaje": "Usuario asociado al negocio correctamente",
+            "id": nueva_asociacion.id
+        }
+
+    finally:
+        db.close()
+
+@app.get("/usuarios-negocio")
+def obtener_usuarios_negocio(ctx: Contexto = Depends(solo_admin)):
+    with engine.connect() as conexion:
+        resultado = conexion.execute(
+            select(UsuarioNegocio).where(
+                UsuarioNegocio.negocio_id == ctx.negocio_id,
+                UsuarioNegocio.activo == True
+            )
+        )
+
+        asociaciones = resultado.fetchall()
+
+        return [
+            {
+                "id": asociacion.id,
+                "usuario_id": asociacion.usuario_id,
+                "negocio_id": asociacion.negocio_id,
+                "rol": asociacion.rol,
+                "activo": asociacion.activo,
+                "fecha_asociacion": asociacion.fecha_asociacion
+            }
+            for asociacion in asociaciones
+        ]
+
+
+
+@app.get("/usuarios-negocio/admin")
+def obtener_usuarios_negocio_admin(ctx: Contexto = Depends(solo_admin)):
+    with engine.connect() as conexion:
+        resultado = conexion.execute(
+            select(UsuarioNegocio).where(UsuarioNegocio.negocio_id == ctx.negocio_id)
+        )
+
+        asociaciones = resultado.fetchall()
+
+        return [
+            {
+                "id": asociacion.id,
+                "usuario_id": asociacion.usuario_id,
+                "negocio_id": asociacion.negocio_id,
+                "rol": asociacion.rol,
+                "activo": asociacion.activo,
+                "fecha_asociacion": asociacion.fecha_asociacion
+            }
+            for asociacion in asociaciones
+        ]
+
+
+
+@app.get("/usuarios-negocio/{usuario_negocio_id}")
+def obtener_usuario_negocio(
+    usuario_negocio_id: int,
+    ctx: Contexto = Depends(solo_admin)
+):
+    db = SessionLocal()
+
+    try:
+        asociacion = obtener_del_negocio(
+            db, UsuarioNegocio, usuario_negocio_id, ctx, "Asociación no encontrada"
+        )
+
+        return {
+            "id": asociacion.id,
+            "usuario_id": asociacion.usuario_id,
+            "negocio_id": asociacion.negocio_id,
+            "rol": asociacion.rol,
+            "activo": asociacion.activo,
+            "fecha_asociacion": asociacion.fecha_asociacion
+        }
+
+    finally:
+        db.close()
+
+@app.put("/usuarios-negocio/{usuario_negocio_id}")
+def actualizar_usuario_negocio(
+    usuario_negocio_id: int,
+    datos: schemas.UsuarioNegocioActualizar,
+    ctx: Contexto = Depends(solo_admin)
+):
+    db = SessionLocal()
+
+    try:
+        asociacion = obtener_del_negocio(
+            db, UsuarioNegocio, usuario_negocio_id, ctx, "Asociación no encontrada"
+        )
+
+        # Degradar a un ADMIN: el negocio tiene que conservar otro.
+        # Se bloquea el negocio para que dos admins no puedan degradarse a la vez.
+        if asociacion.rol == "ADMIN" and datos.rol != "ADMIN":
+            obtener_o_404(
+                db, Negocio, ctx.negocio_id, "Negocio no encontrado", bloquear=True
+            )
+            exigir_queda_otro_admin(db, ctx.negocio_id, asociacion.id)
+
+        asociacion.rol = datos.rol
+
+        db.commit()
+        db.refresh(asociacion)
+
+        return {
+            "mensaje": "Rol actualizado correctamente",
+            "id": asociacion.id
+        }
+
+    finally:
+        db.close()
+
+
+@app.delete("/usuarios-negocio/{usuario_negocio_id}")
+def eliminar_usuario_negocio(
+    usuario_negocio_id: int,
+    ctx: Contexto = Depends(solo_admin)
+):
+    db = SessionLocal()
+
+    try:
+        asociacion = obtener_del_negocio(
+            db, UsuarioNegocio, usuario_negocio_id, ctx, "La asociación no existe"
+        )
+
+        if asociacion.rol == "ADMIN" and asociacion.activo:
+            obtener_o_404(
+                db, Negocio, ctx.negocio_id, "Negocio no encontrado", bloquear=True
+            )
+            exigir_queda_otro_admin(db, ctx.negocio_id, asociacion.id)
+
+        exigir_sin_citas_futuras(
+            db,
+            "desvincular al empleado",
+            usuario_negocio_id=asociacion.id
+        )
+
+        asociacion.activo = False
+
+        db.commit()
+
+        return {"mensaje": "Usuario desvinculado del negocio"}
+
+    finally:
+        db.close()
+
+@app.patch("/usuarios-negocio/{usuario_negocio_id}/activar")
+def activar_usuario_negocio(
+    usuario_negocio_id: int,
+    ctx: Contexto = Depends(solo_admin)
+):
+    db = SessionLocal()
+
+    try:
+        asociacion = obtener_del_negocio(
+            db, UsuarioNegocio, usuario_negocio_id, ctx,
+            "La asociación usuario-negocio no existe"
+        )
+
+        asociacion.activo = True
+
+        db.commit()
+        db.refresh(asociacion)
+
+        return {
+            "mensaje": "Usuario vinculado nuevamente al negocio",
+            "id": asociacion.id
+        }
+
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Negocio
+# ---------------------------------------------------------------------------
+@app.post("/negocios")
+def crear_negocio(negocio: schemas.NegocioCrear, ctx: Contexto = Depends(contexto_usuario)):
+    # Quien crea un negocio queda como su ADMIN
+    db = SessionLocal()
+
+    try:
+        nuevo_negocio = Negocio(
+            nombre=negocio.nombre,
+            telefono=negocio.telefono,
+            direccion=negocio.direccion
+        )
+
+        db.add(nuevo_negocio)
+        db.flush()  # para conocer su id
+
+        db.add(
+            UsuarioNegocio(
+                usuario_id=ctx.usuario_id,
+                negocio_id=nuevo_negocio.id,
+                rol="ADMIN"
+            )
+        )
+
+        db.commit()
+        db.refresh(nuevo_negocio)
+
+        return {
+            "mensaje": "Negocio creado correctamente",
+            "id": nuevo_negocio.id,
+            "rol": "ADMIN",
+            "siguiente_paso": f"POST /auth/negocio/{nuevo_negocio.id} para trabajar con él"
+        }
+
+    finally:
+        db.close()
+
+
+@app.get("/negocios")
+def obtener_negocios(ctx: Contexto = Depends(contexto_usuario)):
+    # Los negocios donde el usuario trabaja
+    db = SessionLocal()
+
+    try:
+        return [
+            {
+                "id": negocio.id,
+                "nombre": negocio.nombre,
+                "telefono": negocio.telefono,
+                "direccion": negocio.direccion,
+                "fecha_creacion": negocio.fecha_creacion,
+                "rol": vinculo.rol
+            }
+            for vinculo, negocio in _negocios_del_usuario(db, ctx.usuario_id)
+        ]
+
+    finally:
+        db.close()
+
+
+@app.get("/negocios/{negocio_id}")
+def obtener_negocio(negocio_id: int, ctx: Contexto = Depends(contexto_usuario)):
+    db = SessionLocal()
+
+    try:
+        filas = _negocios_del_usuario(db, ctx.usuario_id)
+        elegido = next((f for f in filas if f[1].id == negocio_id), None)
+
+        if elegido is None:
+            raise HTTPException(status_code=404, detail="Negocio no encontrado")
+
+        negocio = elegido[1]
+
+        return {
+            "id": negocio.id,
+            "nombre": negocio.nombre,
+            "telefono": negocio.telefono,
+            "direccion": negocio.direccion,
+            "fecha_creacion": negocio.fecha_creacion
+        }
+
+    finally:
+        db.close()
+
+
+@app.put("/negocios/{negocio_id}")
+def actualizar_negocio(
+    negocio_id: int,
+    datos: schemas.NegocioActualizar,
+    ctx: Contexto = Depends(solo_admin)
+):
+    db = SessionLocal()
+
+    try:
+        # Solo el negocio con el que está trabajando el admin
+        if negocio_id != ctx.negocio_id:
+            raise HTTPException(status_code=404, detail="Negocio no encontrado")
+
+        negocio = obtener_o_404(db, Negocio, negocio_id, "Negocio no encontrado")
+
+        negocio.nombre = datos.nombre
+        negocio.telefono = datos.telefono
+        negocio.direccion = datos.direccion
+
+        db.commit()
+        db.refresh(negocio)
+
+        return {
+            "mensaje": "Negocio actualizado correctamente",
+            "id": negocio.id
+        }
+
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Producto  (leer: cualquiera del negocio | escribir: ADMIN)
+# ---------------------------------------------------------------------------
+@app.post("/productos")
+def crear_producto(producto: schemas.ProductoCrear, ctx: Contexto = Depends(solo_admin)):
+    db = SessionLocal()
+
+    try:
+        nuevo_producto = Producto(
+            negocio_id=ctx.negocio_id,
+            nombre=producto.nombre,
+            descripcion=producto.descripcion,
+            precio=producto.precio,
+            stock=producto.stock,
+            activo=True
+        )
+
+        db.add(nuevo_producto)
+        db.commit()
+        db.refresh(nuevo_producto)
+
+        return {
+            "mensaje": "Producto creado correctamente",
+            "id": nuevo_producto.id
+        }
+
+    finally:
+        db.close()
+
+
+@app.get("/productos")
+def obtener_productos(ctx: Contexto = Depends(contexto_negocio)):
+    with engine.connect() as conexion:
+        resultado = conexion.execute(
+            select(Producto).where(
+                Producto.negocio_id == ctx.negocio_id,
+                Producto.activo == True
+            )
+        )
+        productos = resultado.fetchall()
+
+        return [
+            {
+                "id": producto.id,
+                "negocio_id": producto.negocio_id,
+                "nombre": producto.nombre,
+                "descripcion": producto.descripcion,
+                "precio": float(producto.precio),
+                "stock": producto.stock,
+                "activo": producto.activo
+            }
+            for producto in productos
+        ]
+
+
+@app.get("/productos/admin")
+def obtener_todos_los_productos(ctx: Contexto = Depends(solo_admin)):
+    with engine.connect() as conexion:
+        resultado = conexion.execute(
+            select(Producto).where(Producto.negocio_id == ctx.negocio_id)
+        )
+        productos = resultado.fetchall()
+
+        return [
+            {
+                "id": producto.id,
+                "negocio_id": producto.negocio_id,
+                "nombre": producto.nombre,
+                "descripcion": producto.descripcion,
+                "precio": float(producto.precio),
+                "stock": producto.stock,
+                "activo": producto.activo
+            }
+            for producto in productos
+        ]
+
+
+@app.get("/productos/{producto_id}")
+def obtener_producto(producto_id: int, ctx: Contexto = Depends(contexto_negocio)):
+    db = SessionLocal()
+
+    try:
+        producto = obtener_del_negocio(
+            db, Producto, producto_id, ctx, "Producto no encontrado"
+        )
+
+        return {
+            "id": producto.id,
+            "negocio_id": producto.negocio_id,
+            "nombre": producto.nombre,
+            "descripcion": producto.descripcion,
+            "precio": float(producto.precio),
+            "stock": producto.stock,
+            "activo": producto.activo
+        }
+
+    finally:
+        db.close()
+
+
+@app.put("/productos/{producto_id}")
+def actualizar_producto(
+    producto_id: int,
+    datos: schemas.ProductoActualizar,
+    ctx: Contexto = Depends(solo_admin)
+):
+    db = SessionLocal()
+
+    try:
+        producto = obtener_del_negocio(
+            db, Producto, producto_id, ctx, "Producto no encontrado"
+        )
+
+        producto.nombre = datos.nombre
+        producto.descripcion = datos.descripcion
+        producto.precio = datos.precio
+        producto.stock = datos.stock
+
+        db.commit()
+        db.refresh(producto)
+
+        return {
+            "mensaje": "Producto actualizado correctamente",
+            "id": producto.id
+        }
+
+    finally:
+        db.close()
+
+
+@app.delete("/productos/{producto_id}")
+def eliminar_producto(producto_id: int, ctx: Contexto = Depends(solo_admin)):
+    db = SessionLocal()
+
+    try:
+        producto = obtener_del_negocio(
+            db, Producto, producto_id, ctx, "Producto no encontrado"
+        )
+
+        producto.activo = False
+
+        db.commit()
+
+        return {
+            "mensaje": "Producto eliminado correctamente",
+            "id": producto.id
+        }
+
+    finally:
+        db.close()
+
+
+@app.patch("/productos/{producto_id}/activar")
+def activar_producto(producto_id: int, ctx: Contexto = Depends(solo_admin)):
+    db = SessionLocal()
+
+    try:
+        producto = obtener_del_negocio(
+            db, Producto, producto_id, ctx, "Producto no encontrado"
+        )
+
+        producto.activo = True
+
+        db.commit()
+
+        return {
+            "mensaje": "Producto activado correctamente",
+            "id": producto.id
+        }
+
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# EmpleadoServicio (tabla puente, sin id propio -> clave compuesta)
+# leer: cualquiera del negocio | asignar y quitar: ADMIN
+# ---------------------------------------------------------------------------
+@app.post("/empleados-servicios")
+def asignar_empleado_a_servicio(
+    datos: schemas.EmpleadoServicioCrear,
+    ctx: Contexto = Depends(solo_admin)
+):
+    db = SessionLocal()
+
+    try:
+        servicio = obtener_del_negocio(
+            db, Servicio, datos.servicio_id, ctx, "Servicio no encontrado"
+        )
+
+        if not servicio.activo:
+            raise HTTPException(status_code=400, detail="El servicio está inactivo")
+
+        # Empleado activo y del mismo negocio
+        empleado = exigir_empleado_valido(
+            db, datos.usuario_negocio_id, negocio_id=ctx.negocio_id
+        )
+
+        existente = db.get(EmpleadoServicio, (servicio.id, empleado.id))
+
+        if existente is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="Ese empleado ya está asignado a ese servicio"
+            )
+
+        nueva_asignacion = EmpleadoServicio(
+            servicio_id=servicio.id,
+            usuario_negocio_id=empleado.id
+        )
+
+        db.add(nueva_asignacion)
+        db.commit()
+
+        return {
+            "mensaje": "Empleado asignado al servicio correctamente",
+            "servicio_id": nueva_asignacion.servicio_id,
+            "usuario_negocio_id": nueva_asignacion.usuario_negocio_id
+        }
+
+    finally:
+        db.close()
+
+
+@app.get("/empleados-servicios")
+def obtener_empleados_servicios(ctx: Contexto = Depends(contexto_negocio)):
+    with engine.connect() as conexion:
+        resultado = conexion.execute(
+            select(EmpleadoServicio)
+            .join(Servicio, Servicio.id == EmpleadoServicio.servicio_id)
+            .where(Servicio.negocio_id == ctx.negocio_id)
+        )
+        asignaciones = resultado.fetchall()
+
+        return [
+            {
+                "servicio_id": asignacion.servicio_id,
+                "usuario_negocio_id": asignacion.usuario_negocio_id
+            }
+            for asignacion in asignaciones
+        ]
+
+
+@app.delete("/empleados-servicios/{servicio_id}/{usuario_negocio_id}")
+def quitar_empleado_de_servicio(
+    servicio_id: int,
+    usuario_negocio_id: int,
+    ctx: Contexto = Depends(solo_admin)
+):
+    db = SessionLocal()
+
+    try:
+        # Primero se comprueba que el servicio es del negocio del admin
+        obtener_del_negocio(
+            db, Servicio, servicio_id, ctx, "Esa asignación no existe"
+        )
+
+        asignacion = obtener_o_404(
+            db,
+            EmpleadoServicio,
+            (servicio_id, usuario_negocio_id),
+            "Esa asignación no existe"
+        )
+
+        exigir_sin_citas_futuras(
+            db,
+            "quitarle este servicio al empleado",
+            usuario_negocio_id=usuario_negocio_id,
+            servicio_id=servicio_id
+        )
+
+        db.delete(asignacion)
+        db.commit()
+
+        return {"mensaje": "Empleado desvinculado del servicio"}
+
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Horario  (leer: cualquiera del negocio | escribir: ADMIN)
+# ---------------------------------------------------------------------------
+@app.post("/horarios")
+def crear_horario(horario: schemas.HorarioCrear, ctx: Contexto = Depends(solo_admin)):
+    db = SessionLocal()
+
+    try:
+        # Se bloquea al empleado para que dos peticiones simultáneas
+        # no puedan crear horarios que se pisen.
+        empleado = exigir_empleado_valido(
+            db, horario.usuario_negocio_id, ctx.negocio_id, bloquear=True
+        )
+
+        validar_solape_horarios(
+            db,
+            empleado.id,
+            horario.dia_semana,
+            horario.hora_inicio,
+            horario.hora_fin
+        )
+
+        nuevo_horario = Horario(
+            usuario_negocio_id=empleado.id,
+            dia_semana=horario.dia_semana,
+            hora_inicio=horario.hora_inicio,
+            hora_fin=horario.hora_fin,
+            intervalo_minutos=horario.intervalo_minutos,
+            activo=True
+        )
+
+        db.add(nuevo_horario)
+        db.commit()
+        db.refresh(nuevo_horario)
+
+        return {
+            "mensaje": "Horario creado correctamente",
+            "id": nuevo_horario.id
+        }
+
+    finally:
+        db.close()
+
+
+@app.get("/horarios")
+def obtener_horarios(ctx: Contexto = Depends(contexto_negocio)):
+    with engine.connect() as conexion:
+        resultado = conexion.execute(
+            select(Horario)
+            .join(UsuarioNegocio, UsuarioNegocio.id == Horario.usuario_negocio_id)
+            .where(
+                UsuarioNegocio.negocio_id == ctx.negocio_id,
+                Horario.activo == True
+            )
+        )
+        horarios = resultado.fetchall()
+
+        return [
+            {
+                "id": horario.id,
+                "usuario_negocio_id": horario.usuario_negocio_id,
+                "dia_semana": horario.dia_semana,
+                "hora_inicio": horario.hora_inicio,
+                "hora_fin": horario.hora_fin,
+                "intervalo_minutos": horario.intervalo_minutos,
+                "activo": horario.activo
+            }
+            for horario in horarios
+        ]
+
+
+@app.get("/horarios/{horario_id}")
+def obtener_horario(horario_id: int, ctx: Contexto = Depends(contexto_negocio)):
+    db = SessionLocal()
+
+    try:
+        horario = obtener_horario_del_negocio(db, horario_id, ctx)
+
+        return {
+            "id": horario.id,
+            "usuario_negocio_id": horario.usuario_negocio_id,
+            "dia_semana": horario.dia_semana,
+            "hora_inicio": horario.hora_inicio,
+            "hora_fin": horario.hora_fin,
+            "intervalo_minutos": horario.intervalo_minutos,
+            "activo": horario.activo
+        }
+
+    finally:
+        db.close()
+
+
+@app.put("/horarios/{horario_id}")
+def actualizar_horario(
+    horario_id: int,
+    datos: schemas.HorarioActualizar,
+    ctx: Contexto = Depends(solo_admin)
+):
+    db = SessionLocal()
+
+    try:
+        horario = obtener_horario_del_negocio(db, horario_id, ctx)
+
+        obtener_o_404(
+            db, UsuarioNegocio, horario.usuario_negocio_id,
+            "Empleado no encontrado", bloquear=True
+        )
+
+        # Si el horario está desactivado no choca con nada todavía:
+        # el solape se comprueba cuando se vuelva a activar.
+        if horario.activo:
+            validar_solape_horarios(
+                db,
+                horario.usuario_negocio_id,
+                datos.dia_semana,
+                datos.hora_inicio,
+                datos.hora_fin,
+                excluir_horario_id=horario.id
+            )
+
+        validar_pausas_dentro_de_horario(
+            horario, datos.hora_inicio, datos.hora_fin
+        )
+
+        horario.dia_semana = datos.dia_semana
+        horario.hora_inicio = datos.hora_inicio
+        horario.hora_fin = datos.hora_fin
+        horario.intervalo_minutos = datos.intervalo_minutos
+
+        # Con el cambio aplicado (sin commit), las citas futuras deben seguir cabiendo
+        if horario.activo:
+            exigir_agenda_cubre_citas_futuras(
+                db, horario.usuario_negocio_id, "cambiar este horario"
+            )
+
+        db.commit()
+        db.refresh(horario)
+
+        return {
+            "mensaje": "Horario actualizado correctamente",
+            "id": horario.id
+        }
+
+    finally:
+        db.close()
+
+
+@app.delete("/horarios/{horario_id}")
+def eliminar_horario(horario_id: int, ctx: Contexto = Depends(solo_admin)):
+    db = SessionLocal()
+
+    try:
+        horario = obtener_horario_del_negocio(db, horario_id, ctx)
+
+        if horario.activo:
+            horario.activo = False
+
+            exigir_agenda_cubre_citas_futuras(
+                db, horario.usuario_negocio_id, "desactivar este horario"
+            )
+
+        db.commit()
+
+        return {
+            "mensaje": "Horario eliminado correctamente",
+            "id": horario.id
+        }
+
+    finally:
+        db.close()
+
+
+@app.patch("/horarios/{horario_id}/activar")
+def activar_horario(horario_id: int, ctx: Contexto = Depends(solo_admin)):
+    db = SessionLocal()
+
+    try:
+        horario = obtener_horario_del_negocio(db, horario_id, ctx)
+
+        if horario.activo:
+            return {
+                "mensaje": "El horario ya estaba activo",
+                "id": horario.id
+            }
+
+        obtener_o_404(
+            db, UsuarioNegocio, horario.usuario_negocio_id,
+            "Empleado no encontrado", bloquear=True
+        )
+
+        # Al reactivarlo podría pisar un horario creado mientras estuvo apagado
+        validar_solape_horarios(
+            db,
+            horario.usuario_negocio_id,
+            horario.dia_semana,
+            horario.hora_inicio,
+            horario.hora_fin,
+            excluir_horario_id=horario.id
+        )
+
+        horario.activo = True
+
+        db.commit()
+
+        return {
+            "mensaje": "Horario activado correctamente",
+            "id": horario.id
+        }
+
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Pausa (no tiene columna "activo": eliminación es definitiva)
+# leer: cualquiera del negocio | escribir: ADMIN
+# ---------------------------------------------------------------------------
+@app.post("/pausas")
+def crear_pausa(pausa: schemas.PausaCrear, ctx: Contexto = Depends(solo_admin)):
+    db = SessionLocal()
+
+    try:
+        # Se bloquea el horario para que dos pausas simultáneas no se pisen
+        horario = obtener_horario_del_negocio(
+            db, pausa.horario_id, ctx, bloquear=True
+        )
+
+        validar_pausa(db, horario, pausa.hora_inicio, pausa.hora_fin)
+
+        nueva_pausa = Pausa(
+            horario_id=horario.id,
+            hora_inicio=pausa.hora_inicio,
+            hora_fin=pausa.hora_fin,
+            motivo=pausa.motivo
+        )
+
+        db.add(nueva_pausa)
+
+        # La pausa nueva no puede tapar citas que ya están agendadas
+        exigir_agenda_cubre_citas_futuras(
+            db, horario.usuario_negocio_id, "crear esta pausa"
+        )
+
+        db.commit()
+        db.refresh(nueva_pausa)
+
+        return {
+            "mensaje": "Pausa creada correctamente",
+            "id": nueva_pausa.id
+        }
+
+    finally:
+        db.close()
+
+
+@app.get("/pausas")
+def obtener_pausas(ctx: Contexto = Depends(contexto_negocio)):
+    with engine.connect() as conexion:
+        resultado = conexion.execute(
+            select(Pausa)
+            .join(Horario, Horario.id == Pausa.horario_id)
+            .join(UsuarioNegocio, UsuarioNegocio.id == Horario.usuario_negocio_id)
+            .where(UsuarioNegocio.negocio_id == ctx.negocio_id)
+        )
+        pausas = resultado.fetchall()
+
+        return [
+            {
+                "id": pausa.id,
+                "horario_id": pausa.horario_id,
+                "hora_inicio": pausa.hora_inicio,
+                "hora_fin": pausa.hora_fin,
+                "motivo": pausa.motivo
+            }
+            for pausa in pausas
+        ]
+
+
+@app.get("/pausas/{pausa_id}")
+def obtener_pausa(pausa_id: int, ctx: Contexto = Depends(contexto_negocio)):
+    db = SessionLocal()
+
+    try:
+        pausa = obtener_pausa_del_negocio(db, pausa_id, ctx)
+
+        return {
+            "id": pausa.id,
+            "horario_id": pausa.horario_id,
+            "hora_inicio": pausa.hora_inicio,
+            "hora_fin": pausa.hora_fin,
+            "motivo": pausa.motivo
+        }
+
+    finally:
+        db.close()
+
+
+@app.put("/pausas/{pausa_id}")
+def actualizar_pausa(
+    pausa_id: int,
+    datos: schemas.PausaActualizar,
+    ctx: Contexto = Depends(solo_admin)
+):
+    db = SessionLocal()
+
+    try:
+        pausa = obtener_pausa_del_negocio(db, pausa_id, ctx)
+
+        horario = obtener_horario_del_negocio(
+            db, pausa.horario_id, ctx, bloquear=True
+        )
+
+        validar_pausa(
+            db, horario, datos.hora_inicio, datos.hora_fin,
+            excluir_pausa_id=pausa.id
+        )
+
+        pausa.hora_inicio = datos.hora_inicio
+        pausa.hora_fin = datos.hora_fin
+        pausa.motivo = datos.motivo
+
+        exigir_agenda_cubre_citas_futuras(
+            db, horario.usuario_negocio_id, "cambiar esta pausa"
+        )
+
+        db.commit()
+        db.refresh(pausa)
+
+        return {
+            "mensaje": "Pausa actualizada correctamente",
+            "id": pausa.id
+        }
+
+    finally:
+        db.close()
+
+
+@app.delete("/pausas/{pausa_id}")
+def eliminar_pausa(pausa_id: int, ctx: Contexto = Depends(solo_admin)):
+    db = SessionLocal()
+
+    try:
+        pausa = obtener_pausa_del_negocio(db, pausa_id, ctx)
+
+        db.delete(pausa)
+        db.commit()
+
+        return {"mensaje": "Pausa eliminada correctamente"}
+
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Cita
+# leer: cualquiera del negocio
+# crear / editar / cambiar estado / servicios y productos:
+#     ADMIN en cualquier cita; EMPLEADO solo en las suyas
+# eliminar y reasignar: ADMIN
+# ---------------------------------------------------------------------------
+@app.post("/citas")
+def crear_cita(datos: schemas.CitaCrear, ctx: Contexto = Depends(contexto_negocio)):
+    db = SessionLocal()
+
+    try:
+        # Sin usuario_negocio_id la cita queda para quien la crea
+        usuario_negocio_id = (
+            datos.usuario_negocio_id
+            if datos.usuario_negocio_id is not None
+            else ctx.usuario_negocio_id
+        )
+
+        if not ctx.es_admin and usuario_negocio_id != ctx.usuario_negocio_id:
+            raise HTTPException(
+                status_code=403,
+                detail="Como empleado solo puedes agendar citas para ti"
+            )
+
+        exigir_cliente_valido(db, datos.cliente_id, ctx.negocio_id)
+
+        # Se bloquea al empleado: dos citas simultáneas para la misma
+        # persona se atienden una detrás de otra, así no se pisan.
+        empleado = exigir_empleado_valido(
+            db, usuario_negocio_id, ctx.negocio_id, bloquear=True
+        )
+
+        validar_no_en_el_pasado(datos.fecha, datos.hora_inicio)
+        validar_antelacion(datos.fecha, datos.hora_inicio, datos.origen)
+
+        # Precios y duraciones salen de la base de datos, nunca del cliente.
+        # Se copian a la cita para conservar el historial aunque el servicio
+        # cambie de precio después.
+        lineas = []
+
+        for item in datos.servicios:
+            servicio = exigir_servicio_para_empleado(db, item.servicio_id, empleado)
+
+            lineas.append(
+                ServicioDeCita(
+                    servicio_id=servicio.id,
+                    precio_unitario=servicio.precio,
+                    duracion_minutos=servicio.duracion_minutos,
+                    cantidad=item.cantidad
+                )
+            )
+
+        hora_fin = calcular_hora_fin(
+            datos.fecha,
+            datos.hora_inicio,
+            duracion_servicios_minutos(lineas)
+        )
+
+        validar_disponibilidad(
+            db, empleado.id, datos.fecha, datos.hora_inicio, hora_fin
+        )
+
+        validar_cliente_sin_solape(
+            db, datos.cliente_id, datos.fecha, datos.hora_inicio, hora_fin
+        )
+
+        nueva_cita = Cita(
+            negocio_id=ctx.negocio_id,
+            cliente_id=datos.cliente_id,
+            usuario_negocio_id=empleado.id,
+            fecha=datos.fecha,
+            hora_inicio=datos.hora_inicio,
+            hora_fin=hora_fin,
+            estado="PENDIENTE",
+            origen=datos.origen,
+            motivo=datos.motivo,
+            observaciones=datos.observaciones
+        )
+        nueva_cita.servicios = lineas
+
+        db.add(nueva_cita)
+        db.commit()
+        db.refresh(nueva_cita)
+
+        return {
+            "mensaje": "Cita creada correctamente",
+            "id": nueva_cita.id,
+            "hora_fin": nueva_cita.hora_fin.strftime("%H:%M"),
+            "total_servicios": float(
+                sum(l.precio_unitario * l.cantidad for l in lineas)
+            )
+        }
+
+    finally:
+        db.close()
+
+
+@app.get("/citas")
+def obtener_citas(ctx: Contexto = Depends(contexto_negocio)):
+    with engine.connect() as conexion:
+        resultado = conexion.execute(
+            select(Cita).where(Cita.negocio_id == ctx.negocio_id)
+        )
+        citas = resultado.fetchall()
+
+        return [
+            {
+                "id": cita.id,
+                "negocio_id": cita.negocio_id,
+                "cliente_id": cita.cliente_id,
+                "usuario_negocio_id": cita.usuario_negocio_id,
+                "fecha": cita.fecha,
+                "hora_inicio": cita.hora_inicio,
+                "hora_fin": cita.hora_fin,
+                "estado": cita.estado,
+                "origen": cita.origen,
+                "motivo": cita.motivo,
+                "observaciones": cita.observaciones,
+                "fecha_creacion": cita.fecha_creacion,
+                "fecha_actualizacion": cita.fecha_actualizacion
+            }
+            for cita in citas
+        ]
+
+
+@app.get("/citas/{cita_id}")
+def obtener_cita(cita_id: int, ctx: Contexto = Depends(contexto_negocio)):
+    db = SessionLocal()
+
+    try:
+        cita = obtener_del_negocio(db, Cita, cita_id, ctx, "Cita no encontrada")
+
+        return {
+            "id": cita.id,
+            "negocio_id": cita.negocio_id,
+            "cliente_id": cita.cliente_id,
+            "usuario_negocio_id": cita.usuario_negocio_id,
+            "fecha": cita.fecha,
+            "hora_inicio": cita.hora_inicio,
+            "hora_fin": cita.hora_fin,
+            "estado": cita.estado,
+            "origen": cita.origen,
+            "motivo": cita.motivo,
+            "observaciones": cita.observaciones,
+            "fecha_creacion": cita.fecha_creacion,
+            "fecha_actualizacion": cita.fecha_actualizacion
+        }
+
+    finally:
+        db.close()
+
+
+@app.put("/citas/{cita_id}")
+def actualizar_cita(
+    cita_id: int,
+    datos: schemas.CitaActualizar,
+    ctx: Contexto = Depends(contexto_negocio)
+):
+    db = SessionLocal()
+
+    try:
+        cita = obtener_del_negocio(
+            db, Cita, cita_id, ctx, "Cita no encontrada", bloquear=True
+        )
+
+        exigir_puede_operar_cita(ctx, cita)
+        exigir_cita_editable(cita)
+
+        nueva_fecha = datos.fecha or cita.fecha
+        nuevo_inicio = datos.hora_inicio or cita.hora_inicio
+
+        reprogramada = (
+            nueva_fecha != cita.fecha or nuevo_inicio != cita.hora_inicio
+        )
+
+        if reprogramada:
+            empleado = exigir_empleado_valido(
+                db, cita.usuario_negocio_id, cita.negocio_id, bloquear=True
+            )
+
+            validar_no_en_el_pasado(nueva_fecha, nuevo_inicio)
+            validar_antelacion(nueva_fecha, nuevo_inicio, cita.origen)
+
+            nueva_hora_fin = calcular_hora_fin(
+                nueva_fecha, nuevo_inicio, duracion_de_cita_minutos(cita)
+            )
+
+            # excluir_cita_id: la cita no puede chocar consigo misma
+            validar_disponibilidad(
+                db, empleado.id, nueva_fecha, nuevo_inicio, nueva_hora_fin,
+                excluir_cita_id=cita.id
+            )
+
+            validar_cliente_sin_solape(
+                db, cita.cliente_id, nueva_fecha, nuevo_inicio, nueva_hora_fin,
+                excluir_cita_id=cita.id
+            )
+
+            cita.fecha = nueva_fecha
+            cita.hora_inicio = nuevo_inicio
+            cita.hora_fin = nueva_hora_fin
+
+        # model_fields_set distingue "no lo mandé" de "mandé null"
+        # (así se puede borrar el motivo o las observaciones).
+        if "motivo" in datos.model_fields_set:
+            cita.motivo = datos.motivo
+        if "observaciones" in datos.model_fields_set:
+            cita.observaciones = datos.observaciones
+
+        cita.fecha_actualizacion = datetime.now()
+
+        db.commit()
+        db.refresh(cita)
+
+        return {
+            "mensaje": "Cita actualizada correctamente",
+            "id": cita.id
+        }
+
+    finally:
+        db.close()
+
+
+@app.delete("/citas/{cita_id}")
+def eliminar_cita(cita_id: int, ctx: Contexto = Depends(solo_admin)):
+    db = SessionLocal()
+
+    try:
+        cita = obtener_del_negocio(
+            db, Cita, cita_id, ctx, "Cita no encontrada", bloquear=True
+        )
+
+        if cita.estado not in ESTADOS_ELIMINABLES:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"No se puede eliminar una cita en estado {cita.estado}: "
+                    "forma parte del historial. Si está confirmada, cancélala"
+                )
+            )
+
+        # Borrado definitivo: servicios_de_cita y productos_de_cita
+        # tienen ON DELETE CASCADE, así que se limpian solos.
+        db.delete(cita)
+        db.commit()
+
+        return {"mensaje": "Cita eliminada correctamente"}
+
+    finally:
+        db.close()
+
+
+def _cambiar_estado_cita(cita_id: int, nuevo_estado: str, ctx: Contexto):
+    db = SessionLocal()
+
+    try:
+        # Se bloquea la cita: si llegan dos "completar" a la vez, el segundo
+        # espera y ya la encuentra completada (no descuenta stock dos veces).
+        cita = obtener_del_negocio(
+            db, Cita, cita_id, ctx, "Cita no encontrada", bloquear=True
+        )
+
+        exigir_puede_operar_cita(ctx, cita)
+        validar_transicion(cita, nuevo_estado)
+
+        if nuevo_estado in ("COMPLETADA", "NO_ASISTIO"):
+            exigir_cita_iniciada(cita, nuevo_estado)
+
+        if nuevo_estado == "COMPLETADA":
+            descontar_stock_de_cita(db, cita)
+
+        cita.estado = nuevo_estado
+        cita.fecha_actualizacion = datetime.now()
+
+        db.commit()
+        db.refresh(cita)
+
+        return {
+            "mensaje": f"Cita marcada como {nuevo_estado}",
+            "id": cita.id
+        }
+
+    finally:
+        db.close()
+
+
+@app.patch("/citas/{cita_id}/confirmar")
+def confirmar_cita(cita_id: int, ctx: Contexto = Depends(contexto_negocio)):
+    return _cambiar_estado_cita(cita_id, "CONFIRMADA", ctx)
+
+
+@app.patch("/citas/{cita_id}/cancelar")
+def cancelar_cita(cita_id: int, ctx: Contexto = Depends(contexto_negocio)):
+    return _cambiar_estado_cita(cita_id, "CANCELADA", ctx)
+
+
+@app.patch("/citas/{cita_id}/completar")
+def completar_cita(cita_id: int, ctx: Contexto = Depends(contexto_negocio)):
+    return _cambiar_estado_cita(cita_id, "COMPLETADA", ctx)
+
+
+@app.patch("/citas/{cita_id}/no-asistio")
+def marcar_no_asistio(cita_id: int, ctx: Contexto = Depends(contexto_negocio)):
+    return _cambiar_estado_cita(cita_id, "NO_ASISTIO", ctx)
+
+
+@app.patch("/citas/{cita_id}/reasignar")
+def reasignar_cita(
+    cita_id: int,
+    datos: schemas.CitaReasignar,
+    ctx: Contexto = Depends(solo_admin)
+):
+    db = SessionLocal()
+
+    try:
+        cita = obtener_del_negocio(
+            db, Cita, cita_id, ctx, "Cita no encontrada", bloquear=True
+        )
+
+        exigir_cita_editable(cita)
+
+        if datos.usuario_negocio_id == cita.usuario_negocio_id:
+            raise HTTPException(
+                status_code=400,
+                detail="La cita ya está asignada a ese empleado"
+            )
+
+        # El nuevo empleado debe ser del negocio, estar activo...
+        nuevo_empleado = exigir_empleado_valido(
+            db, datos.usuario_negocio_id, cita.negocio_id, bloquear=True
+        )
+
+        # ...atender todos los servicios de la cita...
+        exigir_empleado_atiende_servicios(db, nuevo_empleado, cita.servicios)
+
+        # ...y tener libre ese mismo hueco. La hora no cambia, así que no se
+        # exige que coincida con su cuadrícula de turnos.
+        validar_disponibilidad(
+            db,
+            nuevo_empleado.id,
+            cita.fecha,
+            cita.hora_inicio,
+            cita.hora_fin,
+            excluir_cita_id=cita.id,
+            comprobar_alineacion=False
+        )
+
+        cita.usuario_negocio_id = nuevo_empleado.id
+        cita.fecha_actualizacion = datetime.now()
+
+        db.commit()
+
+        return {
+            "mensaje": "Cita reasignada correctamente",
+            "id": cita.id,
+            "usuario_negocio_id": nuevo_empleado.id
+        }
+
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Servicios de una cita
+# ---------------------------------------------------------------------------
+@app.post("/citas/{cita_id}/servicios")
+def agregar_servicio_a_cita(
+    cita_id: int,
+    datos: schemas.ServicioDeCitaAgregar,
+    ctx: Contexto = Depends(contexto_negocio)
+):
+    db = SessionLocal()
+
+    try:
+        cita = obtener_del_negocio(
+            db, Cita, cita_id, ctx, "Cita no encontrada", bloquear=True
+        )
+
+        exigir_puede_operar_cita(ctx, cita)
+        exigir_cita_editable(cita)
+
+        empleado = exigir_empleado_valido(
+            db, cita.usuario_negocio_id, cita.negocio_id, bloquear=True
+        )
+
+        if any(s.servicio_id == datos.servicio_id for s in cita.servicios):
+            raise HTTPException(
+                status_code=409,
+                detail="Ese servicio ya está en la cita"
+            )
+
+        servicio = exigir_servicio_para_empleado(db, datos.servicio_id, empleado)
+
+        nuevo_servicio_cita = ServicioDeCita(
+            cita_id=cita.id,
+            servicio_id=servicio.id,
+            precio_unitario=servicio.precio,
+            duracion_minutos=servicio.duracion_minutos,
+            cantidad=datos.cantidad
+        )
+
+        # La cita ahora dura más: hay que comprobar que sigue habiendo hueco
+        duracion_total = (
+            duracion_servicios_minutos(cita.servicios)
+            + nuevo_servicio_cita.duracion_minutos * nuevo_servicio_cita.cantidad
+        )
+
+        nueva_hora_fin = calcular_hora_fin(
+            cita.fecha, cita.hora_inicio, duracion_total
+        )
+
+        # La hora de inicio no cambia: solo se revisa que el nuevo final tenga hueco
+        validar_disponibilidad(
+            db, empleado.id, cita.fecha, cita.hora_inicio, nueva_hora_fin,
+            excluir_cita_id=cita.id,
+            comprobar_alineacion=False
+        )
+
+        validar_cliente_sin_solape(
+            db, cita.cliente_id, cita.fecha, cita.hora_inicio, nueva_hora_fin,
+            excluir_cita_id=cita.id
+        )
+
+        db.add(nuevo_servicio_cita)
+        cita.hora_fin = nueva_hora_fin
+        cita.fecha_actualizacion = datetime.now()
+
+        db.commit()
+        db.refresh(nuevo_servicio_cita)
+
+        return {
+            "mensaje": "Servicio agregado a la cita correctamente",
+            "id": nuevo_servicio_cita.id,
+            "hora_fin": nueva_hora_fin.strftime("%H:%M")
+        }
+
+    finally:
+        db.close()
+
+
+@app.get("/citas/{cita_id}/servicios")
+def obtener_servicios_de_cita(cita_id: int, ctx: Contexto = Depends(contexto_negocio)):
+    db = SessionLocal()
+
+    try:
+        cita = obtener_del_negocio(db, Cita, cita_id, ctx, "Cita no encontrada")
+
+        return [
+            {
+                "id": servicio.id,
+                "cita_id": servicio.cita_id,
+                "servicio_id": servicio.servicio_id,
+                "precio_unitario": float(servicio.precio_unitario),
+                "duracion_minutos": servicio.duracion_minutos,
+                "cantidad": servicio.cantidad
+            }
+            for servicio in cita.servicios
+        ]
+
+    finally:
+        db.close()
+
+
+@app.delete("/citas/{cita_id}/servicios/{servicio_id}")
+def quitar_servicio_de_cita(
+    cita_id: int,
+    servicio_id: int,
+    ctx: Contexto = Depends(contexto_negocio)
+):
+    db = SessionLocal()
+
+    try:
+        cita = obtener_del_negocio(
+            db, Cita, cita_id, ctx, "Cita no encontrada", bloquear=True
+        )
+
+        exigir_puede_operar_cita(ctx, cita)
+        exigir_cita_editable(cita)
+
+        servicio_cita = next(
+            (s for s in cita.servicios if s.servicio_id == servicio_id), None
+        )
+
+        if servicio_cita is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Ese servicio no está asociado a esta cita"
+            )
+
+        restantes = [s for s in cita.servicios if s.id != servicio_cita.id]
+
+        if not restantes:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Una cita debe tener al menos un servicio. "
+                    "Si ya no se va a realizar, cancélala"
+                )
+            )
+
+        # La cita queda más corta, así que no hace falta revisar disponibilidad
+        cita.hora_fin = calcular_hora_fin(
+            cita.fecha, cita.hora_inicio, duracion_servicios_minutos(restantes)
+        )
+        cita.fecha_actualizacion = datetime.now()
+
+        db.delete(servicio_cita)
+        db.commit()
+
+        return {
+            "mensaje": "Servicio quitado de la cita correctamente",
+            "hora_fin": cita.hora_fin.strftime("%H:%M")
+        }
+
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Productos de una cita
+# ---------------------------------------------------------------------------
+@app.post("/citas/{cita_id}/productos")
+def agregar_producto_a_cita(
+    cita_id: int,
+    datos: schemas.ProductoDeCitaAgregar,
+    ctx: Contexto = Depends(contexto_negocio)
+):
+    db = SessionLocal()
+
+    try:
+        cita = obtener_del_negocio(
+            db, Cita, cita_id, ctx, "Cita no encontrada", bloquear=True
+        )
+
+        exigir_puede_operar_cita(ctx, cita)
+        exigir_cita_editable(cita)
+
+        if any(p.producto_id == datos.producto_id for p in cita.productos):
+            raise HTTPException(
+                status_code=409,
+                detail="Ese producto ya está en la cita"
+            )
+
+        # Valida existencia, negocio, activo y stock. El precio lo pone el servidor.
+        producto = exigir_producto_para_cita(
+            db, datos.producto_id, datos.cantidad, cita.negocio_id
+        )
+
+        nuevo_producto_cita = ProductoDeCita(
+            cita_id=cita.id,
+            producto_id=producto.id,
+            cantidad=datos.cantidad,
+            precio_unitario=producto.precio
+        )
+
+        db.add(nuevo_producto_cita)
+        cita.fecha_actualizacion = datetime.now()
+
+        db.commit()
+        db.refresh(nuevo_producto_cita)
+
+        return {
+            "mensaje": "Producto agregado a la cita correctamente",
+            "id": nuevo_producto_cita.id
+        }
+
+    finally:
+        db.close()
+
+
+@app.get("/citas/{cita_id}/productos")
+def obtener_productos_de_cita(cita_id: int, ctx: Contexto = Depends(contexto_negocio)):
+    db = SessionLocal()
+
+    try:
+        cita = obtener_del_negocio(db, Cita, cita_id, ctx, "Cita no encontrada")
+
+        return [
+            {
+                "id": producto.id,
+                "cita_id": producto.cita_id,
+                "producto_id": producto.producto_id,
+                "cantidad": producto.cantidad,
+                "precio_unitario": float(producto.precio_unitario)
+            }
+            for producto in cita.productos
+        ]
+
+    finally:
+        db.close()
+
+
+@app.delete("/citas/{cita_id}/productos/{producto_id}")
+def quitar_producto_de_cita(
+    cita_id: int,
+    producto_id: int,
+    ctx: Contexto = Depends(contexto_negocio)
+):
+    db = SessionLocal()
+
+    try:
+        cita = obtener_del_negocio(
+            db, Cita, cita_id, ctx, "Cita no encontrada", bloquear=True
+        )
+
+        exigir_puede_operar_cita(ctx, cita)
+        exigir_cita_editable(cita)
+
+        producto_cita = next(
+            (p for p in cita.productos if p.producto_id == producto_id), None
+        )
+
+        if producto_cita is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Ese producto no está asociado a esta cita"
+            )
+
+        db.delete(producto_cita)
+        cita.fecha_actualizacion = datetime.now()
+
+        db.commit()
+
+        return {"mensaje": "Producto quitado de la cita correctamente"}
+
+    finally:
+        db.close()
