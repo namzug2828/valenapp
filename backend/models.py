@@ -6,6 +6,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     SmallInteger,
@@ -144,6 +145,9 @@ class Cita(Base):
             "origen IN ('CLIENTE', 'NEGOCIO', 'EMPLEADO')", name="chk_cita_origen"
         ),
         CheckConstraint("hora_inicio < hora_fin", name="chk_cita_horas"),
+        Index("ix_cita_negocio_fecha", "negocio_id", "fecha"),
+        Index("ix_cita_empleado_fecha", "usuario_negocio_id", "fecha"),
+        Index("ix_cita_cliente_fecha", "cliente_id", "fecha"),
     )
 
     id = Column(BigInteger, primary_key=True)

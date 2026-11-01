@@ -24,6 +24,7 @@ BASE = "http://127.0.0.1:8000"
 CLAVE = "Clave12345"
 SUF = str(int(time.time()))
 MODO_PRUEBAS = False
+ORIGEN_PERMITIDO = "http://localhost:5173"   # uno de los de VALEN_ORIGENES_PERMITIDOS
 
 E = {}            # estado compartido: ids y tokens que se van creando
 ok = 0
@@ -892,15 +893,126 @@ def s14_roles_en_vivo():
 
 
 # ---------------------------------------------------------------------------
+# 15. Calendario: CORS, citas completas, filtros y disponibilidad
+# ---------------------------------------------------------------------------
+def preflight(origen):
+    """Simula lo que hace el navegador antes de llamar a la API desde otra página (OPTIONS)."""
+    peticion = urlreq.Request(BASE + "/citas", method="OPTIONS")
+    peticion.add_header("Origin", origen)
+    peticion.add_header("Access-Control-Request-Method", "GET")
+    peticion.add_header("Access-Control-Request-Headers", "authorization")
+
+    try:
+        with urlreq.urlopen(peticion, timeout=30) as respuesta:
+            return respuesta.status, {k.lower(): v for k, v in respuesta.headers.items()}
+    except urlerr.HTTPError as error:
+        return error.code, {k.lower(): v for k, v in error.headers.items()}
+
+
+def s15_calendario():
+    titulo("15. Calendario: CORS, citas completas, filtros y disponibilidad")
+
+    codigo, cab = preflight(ORIGEN_PERMITIDO)
+    verificar(f"CORS: {ORIGEN_PERMITIDO} puede llamar a la API desde el navegador",
+              codigo == 200 and cab.get("access-control-allow-origin") == ORIGEN_PERMITIDO,
+              f"(llegó {codigo}, allow-origin={cab.get('access-control-allow-origin')}; ¿definiste VALEN_ORIGENES_PERMITIDOS distinto? usa --origen-permitido)")
+    codigo, cab = preflight("https://sitio-malicioso.example")
+    verificar("CORS: un origen no autorizado NO recibe permiso", "access-control-allow-origin" not in cab,
+              f"(llegó {codigo}, allow-origin={cab.get('access-control-allow-origin')})")
+
+    if not requiere("tok_ana", "tok_bruno", "un_bruno", "un_ana", "srv_corte", "srv_tinte", "srv_manicure", "cli_laura",
+                    "cli_sincitas", "cita_laura", "cita_marcos_largo", "cita_marcos_corto"):
+        return
+
+    T, B = E["tok_ana"], E["tok_bruno"]
+    L = LUNES.isoformat()
+
+    # --- citas completas para el calendario
+    cuerpo = probar("GET /citas del lunes", llamar("GET", f"/citas?desde={L}&hasta={L}", token=B))
+    verificar("...son 5 citas", isinstance(cuerpo, list) and len(cuerpo) == 5, f"(hay {len(cuerpo) if isinstance(cuerpo, list) else '?'})")
+    laura = next((c for c in cuerpo if c.get("id") == E["cita_laura"]), None) if isinstance(cuerpo, list) else None
+    if laura:
+        verificar("...trae cliente, empleado y servicios con nombre",
+                  laura["cliente"]["nombre"] == "TEST Laura" and laura["empleado"]["nombre"] == "TEST Bruno"
+                  and [s["nombre"] for s in laura["servicios"]] == ["TEST Corte"])
+        verificar("...trae fechas ISO para el calendario",
+                  laura["inicio"] == f"{L}T10:00:00" and laura["fin"] == f"{L}T10:30:00" and laura["duracion_minutos"] == 30)
+        verificar("...trae totales (servicios 25000 + productos 15045000 = 15070000)",
+                  (laura["total_servicios"], laura["total_productos"], laura["total"]) == (25000.0, 15045000.0, 15070000.0),
+                  f"(total {laura['total']})")
+        verificar("...y conserva los campos de siempre", all(k in laura for k in ("cliente_id", "usuario_negocio_id", "hora_inicio", "hora_fin", "estado")))
+    else:
+        verificar("...incluye la cita de Laura", False)
+
+    cuerpo = probar("GET /citas/{id} devuelve la misma estructura", llamar("GET", f"/citas/{E['cita_laura']}", token=B))
+    verificar("...con cliente y servicios", isinstance(cuerpo, dict) and cuerpo.get("cliente", {}).get("nombre") == "TEST Laura" and len(cuerpo.get("servicios", [])) == 1)
+
+    # --- filtros
+    def cuantas(ruta, token=T):
+        c = llamar("GET", ruta, token=token)
+        return c[0], (len(c[1]) if isinstance(c[1], list) else None)
+
+    verificar("filtro por empleado: Bruno tiene 3 citas", cuantas(f"/citas?desde={L}&hasta={L}&empleado_id={E['un_bruno']}") == (200, 3))
+    verificar("filtro por empleado: Ana tiene 2 (la suya y la reasignada)", cuantas(f"/citas?desde={L}&hasta={L}&empleado_id={E['un_ana']}") == (200, 2))
+    verificar("solo_mias: Bruno ve sus 3", cuantas(f"/citas?desde={L}&hasta={L}&solo_mias=true", B) == (200, 3))
+    verificar("solo_mias: Ana ve sus 2", cuantas(f"/citas?desde={L}&hasta={L}&solo_mias=true", T) == (200, 2))
+    verificar("filtro por cliente: Laura tiene 1", cuantas(f"/citas?desde={L}&hasta={L}&cliente_id={E['cli_laura']}") == (200, 1))
+    verificar("filtro por estado CANCELADA: ninguna", cuantas(f"/citas?desde={L}&hasta={L}&estado=CANCELADA") == (200, 0))
+    verificar("filtro por varios estados a la vez", cuantas(f"/citas?desde={L}&hasta={L}&estado=PENDIENTE&estado=CONFIRMADA&estado=COMPLETADA")[1] == 5)
+    verificar("el día siguiente no tiene citas", cuantas(f"/citas?desde={(LUNES + timedelta(days=1)).isoformat()}&hasta={(LUNES + timedelta(days=1)).isoformat()}") == (200, 0))
+    probar("estado inventado -> 422", llamar("GET", f"/citas?estado=XYZ", token=T), 422)
+    probar("'hasta' antes que 'desde' -> 400", llamar("GET", f"/citas?desde={L}&hasta={(LUNES - timedelta(days=1)).isoformat()}", token=T), 400)
+    probar("más de 92 días en una consulta -> 400", llamar("GET", f"/citas?desde={L}&hasta={(LUNES + timedelta(days=93)).isoformat()}", token=T), 400, "92")
+    probar("sin token -> 401", llamar("GET", f"/citas?desde={L}&hasta={L}"), 401)
+    verificar("sin parámetros funciona (hoy y los próximos 30 días)", cuantas("/citas")[0] == 200)
+
+    # --- disponibilidad
+    def huecos(servicios, empleado=None, fecha=LUNES, token=B):
+        consulta = "".join(f"&servicio_id={s}" for s in servicios)
+        codigo, c = llamar("GET", f"/disponibilidad?empleado_id={empleado or E['un_bruno']}&fecha={fecha.isoformat()}{consulta}", token=token)
+        return codigo, ([h["inicio"] for h in c["huecos"]] if isinstance(c, dict) and "huecos" in c else c)
+
+    esperado_corte = ["09:00", "09:30", "10:30", "11:00", "11:30", "13:00", "13:30", "16:00", "17:00", "17:30"]
+    codigo, lista = huecos([E["srv_corte"]])
+    verificar("disponibilidad de Bruno el lunes para un Corte (descuenta cita de Laura, almuerzo y citas de la tarde)",
+              codigo == 200 and lista == esperado_corte, f"(llegó {codigo}: {lista})")
+    cuerpo = llamar("GET", f"/disponibilidad?empleado_id={E['un_bruno']}&fecha={L}&servicio_id={E['srv_corte']}", token=B)[1]
+    verificar("...cada hueco trae su hora de fin", isinstance(cuerpo, dict) and cuerpo["huecos"][0] == {"inicio": "09:00", "fin": "09:30"} and cuerpo["duracion_minutos"] == 30)
+    codigo, lista = huecos([E["srv_tinte"]])
+    verificar("para un Tinte de 90 min solo cabe a las 10:30", (codigo, lista) == (200, ["10:30"]), f"(llegó {codigo}: {lista})")
+    codigo, lista = huecos([E["srv_corte"], E["srv_tinte"]])
+    verificar("Corte + Tinte (120 min): no hay hueco", (codigo, lista) == (200, []), f"(llegó {codigo}: {lista})")
+    verificar("en domingo Bruno no trabaja: lista vacía", huecos([E["srv_corte"]], fecha=DOMINGO) == (200, []))
+    verificar("una fecha pasada: lista vacía", huecos([E["srv_corte"]], fecha=date.today() - timedelta(days=3)) == (200, []))
+    probar("Bruno no hace Manicure -> 400", llamar("GET", f"/disponibilidad?empleado_id={E['un_bruno']}&fecha={L}&servicio_id={E['srv_manicure']}", token=B), 400, "no tiene asignado")
+    probar("servicio repetido -> 400", llamar("GET", f"/disponibilidad?empleado_id={E['un_bruno']}&fecha={L}&servicio_id={E['srv_corte']}&servicio_id={E['srv_corte']}", token=B), 400)
+    probar("empleado inexistente -> 404", llamar("GET", f"/disponibilidad?empleado_id=999999999&fecha={L}&servicio_id={E['srv_corte']}", token=B), 404)
+    probar("sin indicar servicio -> 422", llamar("GET", f"/disponibilidad?empleado_id={E['un_bruno']}&fecha={L}", token=B), 422)
+    probar("fecha inválida -> 422", llamar("GET", f"/disponibilidad?empleado_id={E['un_bruno']}&fecha=2026-13-45&servicio_id={E['srv_corte']}", token=B), 422)
+    probar("sin token -> 401", llamar("GET", f"/disponibilidad?empleado_id={E['un_bruno']}&fecha={L}&servicio_id={E['srv_corte']}"), 401)
+    if E.get("tok_carla_b"):
+        probar("un empleado de otro negocio no se puede consultar -> 400",
+               llamar("GET", f"/disponibilidad?empleado_id={E['un_bruno']}&fecha={L}&servicio_id={E['srv_corte']}", token=E["tok_carla_b"]), 400)
+
+    # --- lo que se ofrece como libre se puede reservar, y deja de ofrecerse
+    probar("reservar la primera hora ofrecida (09:00)",
+           llamar("POST", "/citas", cita_body(E["cli_sincitas"], LUNES, "09:00", [E["srv_corte"]]), B))
+    codigo, lista = huecos([E["srv_corte"]])
+    verificar("...y esa hora ya no aparece como libre", codigo == 200 and "09:00" not in lista and lista == esperado_corte[1:], f"(llegó {lista})")
+    probar("una hora que NO se ofrece (10:00) se rechaza al reservar",
+           llamar("POST", "/citas", cita_body(E["cli_marcos"], LUNES, "10:00", [E["srv_corte"]]), B), 409)
+
+
+# ---------------------------------------------------------------------------
 # Programa principal
 # ---------------------------------------------------------------------------
 SECCIONES = (s1_registro_y_login, s2_negocio_y_catalogo, s3_equipo_y_permisos, s4_horarios_y_pausas, s5_clientes,
              s6_citas_reglas_de_agenda, s7_servicios_y_productos_de_cita, s8_estados, s9_reasignar, s10_citas_futuras,
-             s11_aislamiento, s12_varios_negocios, s13_perfiles, s14_roles_en_vivo)
+             s11_aislamiento, s12_varios_negocios, s13_perfiles, s14_roles_en_vivo, s15_calendario)
 
 
 def main():
-    global BASE, MODO_PRUEBAS
+    global BASE, MODO_PRUEBAS, ORIGEN_PERMITIDO
 
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -909,8 +1021,11 @@ def main():
     parser.add_argument("--url", default=BASE, help="dirección del servidor (por defecto %(default)s)")
     parser.add_argument("--modo-pruebas", action="store_true",
                         help="usa esto solo si arrancaste el servidor con VALEN_MODO_PRUEBAS=1")
+    parser.add_argument("--origen-permitido", default=ORIGEN_PERMITIDO,
+                        help="un origen que SÍ esté en VALEN_ORIGENES_PERMITIDOS (por defecto %(default)s)")
     argumentos = parser.parse_args()
     BASE, MODO_PRUEBAS = argumentos.url.rstrip("/"), argumentos.modo_pruebas
+    ORIGEN_PERMITIDO = argumentos.origen_permitido
 
     print(f"Probando {BASE}  (modo pruebas: {'sí' if MODO_PRUEBAS else 'no'}; identificador de esta corrida: {SUF})")
 

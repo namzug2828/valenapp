@@ -3,10 +3,13 @@
 # $env:VALEN_SECRET_KEY = "PEGA_AQUI_LA_CLAVE_GENERADA"
 # uvicorn main:app --reload
 import logging
+import os
 from datetime import datetime
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
@@ -59,12 +62,38 @@ from reglas import (
     validar_solape_horarios,
     validar_transicion,
 )
+from agenda import router as router_agenda
 import schemas
 from seguridad import HASH_DE_RELLENO, hashear_password, verificar_password
 
 logger = logging.getLogger("valen")
 
 app = FastAPI()
+
+# CORS: qué páginas web (orígenes) pueden llamar a esta API desde el navegador.
+# En producción define VALEN_ORIGENES_PERMITIDOS con tus dominios, separados por coma:
+#   $env:VALEN_ORIGENES_PERMITIDOS = "https://app.tudominio.com,https://reservas.tudominio.com"
+ORIGENES_PERMITIDOS = [
+    origen.strip()
+    for origen in os.getenv(
+        "VALEN_ORIGENES_PERMITIDOS",
+        "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000",
+    ).split(",")
+    if origen.strip()
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ORIGENES_PERMITIDOS,
+    allow_credentials=False,  # el token viaja en la cabecera Authorization, no en cookies
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+
+# Citas para el calendario y disponibilidad de empleados (ver agenda.py)
+app.include_router(router_agenda)
+
+
 
 # Quién puede hacer qué (cada endpoint lo declara en su Depends):
 #   Público ............ POST /usuarios, POST /auth/login, / y /prueba-db
@@ -1756,59 +1785,7 @@ def crear_cita(datos: schemas.CitaCrear, ctx: Contexto = Depends(contexto_negoci
         db.close()
 
 
-@app.get("/citas")
-def obtener_citas(ctx: Contexto = Depends(contexto_negocio)):
-    with engine.connect() as conexion:
-        resultado = conexion.execute(
-            select(Cita).where(Cita.negocio_id == ctx.negocio_id)
-        )
-        citas = resultado.fetchall()
-
-        return [
-            {
-                "id": cita.id,
-                "negocio_id": cita.negocio_id,
-                "cliente_id": cita.cliente_id,
-                "usuario_negocio_id": cita.usuario_negocio_id,
-                "fecha": cita.fecha,
-                "hora_inicio": cita.hora_inicio,
-                "hora_fin": cita.hora_fin,
-                "estado": cita.estado,
-                "origen": cita.origen,
-                "motivo": cita.motivo,
-                "observaciones": cita.observaciones,
-                "fecha_creacion": cita.fecha_creacion,
-                "fecha_actualizacion": cita.fecha_actualizacion
-            }
-            for cita in citas
-        ]
-
-
-@app.get("/citas/{cita_id}")
-def obtener_cita(cita_id: int, ctx: Contexto = Depends(contexto_negocio)):
-    db = SessionLocal()
-
-    try:
-        cita = obtener_del_negocio(db, Cita, cita_id, ctx, "Cita no encontrada")
-
-        return {
-            "id": cita.id,
-            "negocio_id": cita.negocio_id,
-            "cliente_id": cita.cliente_id,
-            "usuario_negocio_id": cita.usuario_negocio_id,
-            "fecha": cita.fecha,
-            "hora_inicio": cita.hora_inicio,
-            "hora_fin": cita.hora_fin,
-            "estado": cita.estado,
-            "origen": cita.origen,
-            "motivo": cita.motivo,
-            "observaciones": cita.observaciones,
-            "fecha_creacion": cita.fecha_creacion,
-            "fecha_actualizacion": cita.fecha_actualizacion
-        }
-
-    finally:
-        db.close()
+# GET /citas y GET /citas/{cita_id} viven ahora en agenda.py (respuesta completa para el calendario)
 
 
 @app.put("/citas/{cita_id}")
